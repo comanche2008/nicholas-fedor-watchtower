@@ -1005,12 +1005,13 @@ func getLinksFromHostConfig(c *Container, clog *zerolog.Logger) []string {
 	}
 
 	// Add network dependency.
+	//
+	// Unlike a Compose service reference, network mode is a Docker identity.
+	// The daemon stores container:<id> after create. List inspect rewrites
+	// that to container:<name>. Do not prefix either form with this
+	// container's Compose project.
 	if networkMode.IsContainer() {
 		normalizedName := util.NormalizeContainerName(networkMode.ConnectedContainer())
-		if projectName != "" && !strings.HasPrefix(normalizedName, projectName+"-") {
-			normalizedName = projectName + "-" + normalizedName
-		}
-
 		normalizedLinks = append(normalizedLinks, normalizedName)
 	}
 
