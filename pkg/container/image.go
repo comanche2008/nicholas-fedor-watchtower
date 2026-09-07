@@ -713,12 +713,14 @@ func (c imageClient) performImagePull(
 	clog := &clogVal
 	clog.Debug().Msg("Initiating image pull")
 
-	pullHost, hostErr := auth.GetRegistryAddress(clog, imageName)
-	if hostErr != nil || pullHost == "" {
+	address, hostErr := auth.GetRegistryAddress(clog, imageName)
+	if hostErr != nil || address == "" {
 		clog.Debug().
 			Err(hostErr).
 			Msg("Failed to resolve registry host for rate limiting")
 	}
+
+	pullHost := ratelimit.Scope(address, opts.RegistryAuth != "")
 
 	pullErr := ratelimit.Do(ctx, clog, pullHost, func() error {
 		err := acquirePullSlot(ctx, pullHost)

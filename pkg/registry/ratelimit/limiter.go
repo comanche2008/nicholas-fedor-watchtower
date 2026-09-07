@@ -3,8 +3,11 @@ package ratelimit
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/nicholas-fedor/watchtower/pkg/registry/hosts"
 )
 
 // hostState holds the cooldown and token-bucket budget for one registry host.
@@ -23,19 +26,163 @@ type hostState struct {
 	lastRefill time.Time
 }
 
-var (
-	hostsMu sync.Mutex
-	hosts   = map[string]*hostState{}
+const (
+	// anonSuffix marks limiter keys for unauthenticated GHCR traffic.
+	anonSuffix = "|anon"
 )
 
-// ResetForTest clears per-host cooldown and quota state.
+var (
+	hostsMu     sync.Mutex
+	hostStates  = map[string]*hostState{}
+	serialMu    sync.Mutex
+	serialSlots = map[string]chan struct{}{}
+)
+
+// ResetForTest clears per-host cooldown, quota, and serial-slot state.
 //
-// Tests call this so one case cannot leak a cooldown into the next.
+// Tests call this so one case cannot leak a cooldown or serial hold into the next.
+// It also restores the production honor window used by [Do] and [DoValue].
 func ResetForTest() {
 	hostsMu.Lock()
-	defer hostsMu.Unlock()
+	hostStates = map[string]*hostState{}
+	retryElapsed = maxRetryElapsed
+	hostsMu.Unlock()
 
-	hosts = map[string]*hostState{}
+	serialMu.Lock()
+	serialSlots = map[string]chan struct{}{}
+	serialMu.Unlock()
+}
+
+// Scope returns the limiter key for host.
+//
+// Unauthenticated GHCR uses a distinct key so anonymous 429s cannot pace
+// authenticated traffic to the same registry. Unauthenticated
+// [hosts.LSCRRegistryDomain] is normalized to the same key as GHCR, matching
+// the manifest remap.
+//
+// Parameters:
+//   - host: Registry host, such as ghcr.io. Empty values return empty.
+//   - authenticated: True when the caller has registry credentials.
+//
+// Returns:
+//   - string: Limiter key. Unauthenticated GHCR is "ghcr.io|anon".
+func Scope(host string, authenticated bool) string {
+	if host == "" {
+		return ""
+	}
+
+	if !authenticated && hosts.IsGitHubRegistry(host) {
+		return hosts.GitHubRegistryDomain + anonSuffix
+	}
+
+	return host
+}
+
+// IsAnonymousScope reports whether key is the unauthenticated GHCR limiter key.
+//
+// Parameters:
+//   - key: Limiter key from [Scope].
+//
+// Returns:
+//   - bool: True when key is the anonymous GHCR scope.
+func IsAnonymousScope(key string) bool {
+	return strings.HasSuffix(key, anonSuffix)
+}
+
+// HoldAnonymous returns the limiter key for host and, for unauthenticated GHCR,
+// acquires the one-at-a-time serial slot with [AcquireSerial].
+//
+// The release function is always non-nil. Callers should defer it. Authenticated
+// GHCR and other registries do not take the serial slot.
+//
+// Parameters:
+//   - ctx: Context that can cancel the serial wait.
+//   - host: Canonical registry host. Empty hosts skip the hold.
+//   - authenticated: True when the caller has registry credentials.
+//
+// Returns:
+//   - string: Limiter key from [Scope].
+//   - func(): Release callback. A no-op when no slot was acquired.
+//   - error: [context.Context.Err] when canceled while waiting for the serial slot.
+func HoldAnonymous(ctx context.Context, host string, authenticated bool) (string, func(), error) {
+	key := Scope(host, authenticated)
+	release := func() {}
+
+	if !IsAnonymousScope(key) {
+		return key, release, nil
+	}
+
+	err := AcquireSerial(ctx, key)
+	if err != nil {
+		return key, release, err
+	}
+
+	return key, func() { ReleaseSerial(key) }, nil
+}
+
+// AcquireSerial blocks until this process may run one operation on key.
+//
+// Empty keys return immediately. [ReleaseSerial] must be called for the same key.
+//
+// Parameters:
+//   - ctx: Context that can cancel the wait.
+//   - key: Serial slot key. Empty values return immediately.
+//
+// Returns:
+//   - error: [context.Context.Err] when canceled. Nil when the caller may proceed.
+func AcquireSerial(ctx context.Context, key string) error {
+	if key == "" {
+		return nil
+	}
+
+	ctxErr := ctx.Err()
+	if ctxErr != nil {
+		return fmt.Errorf("registry serial wait canceled: %w", ctxErr)
+	}
+
+	select {
+	case serialSlotFor(key) <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("registry serial wait canceled: %w", ctx.Err())
+	}
+}
+
+// ReleaseSerial returns a serial slot acquired with [AcquireSerial].
+//
+// Empty keys and slots that are not held are ignored.
+//
+// Parameters:
+//   - key: Serial slot key passed to [AcquireSerial].
+func ReleaseSerial(key string) {
+	if key == "" {
+		return
+	}
+
+	select {
+	case <-serialSlotFor(key):
+	default:
+	}
+}
+
+// serialSlotFor returns the capacity-1 slot for key, creating it when missing.
+//
+// Parameters:
+//   - key: Serial slot key.
+//
+// Returns:
+//   - chan struct{}: Buffered channel used as a mutex. Capacity is 1.
+func serialSlotFor(key string) chan struct{} {
+	serialMu.Lock()
+	defer serialMu.Unlock()
+
+	slot := serialSlots[key]
+	if slot == nil {
+		slot = make(chan struct{}, 1)
+		serialSlots[key] = slot
+	}
+
+	return slot
 }
 
 // Observe records a 429 against host so later Wait calls honor it.
@@ -110,7 +257,7 @@ func ObserveSuccess(host string) {
 	hostsMu.Lock()
 	defer hostsMu.Unlock()
 
-	state := hosts[host]
+	state := hostStates[host]
 	if state == nil || state.allowed <= 0 || state.window <= 0 {
 		return
 	}
@@ -227,7 +374,7 @@ func nextCooldownWait(host string) time.Duration {
 	hostsMu.Lock()
 	defer hostsMu.Unlock()
 
-	state := hosts[host]
+	state := hostStates[host]
 	if state == nil || !time.Now().Before(state.cooldownUntil) {
 		return 0
 	}
@@ -245,10 +392,10 @@ func nextCooldownWait(host string) time.Duration {
 // Returns:
 //   - *hostState: Existing or newly created state for host.
 func hostLocked(host string) *hostState {
-	state := hosts[host]
+	state := hostStates[host]
 	if state == nil {
 		state = &hostState{lastRefill: time.Now()}
-		hosts[host] = state
+		hostStates[host] = state
 	}
 
 	return state

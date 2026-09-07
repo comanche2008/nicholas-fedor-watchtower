@@ -79,14 +79,70 @@ func TestDoLogsExhaustionAtWarn(t *testing.T) {
 
 	var buf bytes.Buffer
 
-	log := zerolog.New(&buf)
+	log := zerolog.New(&buf).Level(zerolog.DebugLevel)
 
 	err := Do(t.Context(), &log, "registry.example", func() error {
-		return &Error{RetryAfter: minHonorWait}
+		return &Error{RetryAfter: 2 * time.Hour}
 	})
 	require.ErrorIs(t, err, ErrRateLimited)
 	assert.Contains(t, buf.String(), `"level":"warn"`)
 	assert.Contains(t, buf.String(), "Registry rate limited. Stopping retries")
+	assert.Contains(t, buf.String(), `"attempts":1`)
+	assert.NotContains(t, buf.String(), "Retrying after delay")
+}
+
+func TestDoRetriesPastFiveWhenRetryAfterIsTiny(t *testing.T) {
+	ResetForTest()
+
+	var attempts atomic.Int32
+
+	err := Do(t.Context(), testLog(), "ghcr.io", func() error {
+		if attempts.Add(1) < 8 {
+			return &Error{
+				RetryAfter:    23722 * time.Nanosecond,
+				Allowed:       44000,
+				AllowedWindow: time.Minute,
+				Host:          "ghcr.io",
+			}
+		}
+
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int32(8), attempts.Load())
+}
+
+func TestDoGivesUpWhenTinyRetryAfterExceedsElapsedBudget(t *testing.T) {
+	ResetForTest()
+
+	retryElapsed = 450 * time.Millisecond
+
+	defer ResetForTest()
+
+	var buf bytes.Buffer
+
+	log := zerolog.New(&buf).Level(zerolog.DebugLevel)
+
+	var attempts atomic.Int32
+
+	started := time.Now()
+	err := Do(t.Context(), &log, "ghcr.io", func() error {
+		attempts.Add(1)
+
+		return &Error{
+			RetryAfter:    23722 * time.Nanosecond,
+			Allowed:       44000,
+			AllowedWindow: time.Minute,
+		}
+	})
+	require.ErrorIs(t, err, ErrRateLimited)
+	assert.Contains(t, buf.String(), "Registry rate limited. Stopping retries")
+	assert.Contains(t, buf.String(), "Retrying after delay")
+
+	maxStep := minHonorWait + minHonorWait/equalJitterDivisor
+	minAttempts := int(retryElapsed / maxStep)
+	assert.GreaterOrEqual(t, attempts.Load(), int32(minAttempts))
+	assert.GreaterOrEqual(t, time.Since(started), time.Duration(minAttempts-1)*minHonorWait)
 }
 
 func TestDoRetriesRateLimitedOperations(t *testing.T) {
